@@ -1,0 +1,585 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Chinese Go Game - Multiplayer Rooms (Socket.IO)</title>
+  <style>
+    /* Board container with grid lines for intersections */
+    #board {
+      position: relative;
+      width: 721px;
+      height: 721px;
+      margin: 20px auto;
+      background-color: #f5deb3;
+      background-image: 
+        linear-gradient(90deg, black 1px, transparent 1px),
+        linear-gradient(180deg, black 1px, transparent 1px);
+      background-size: 40px 40px;
+      border: 1px solid black;
+      display: none; /* Hide until room is joined */
+    }
+    /* Each intersection is an absolutely positioned clickable area */
+    .intersection {
+      position: absolute;
+      width: 40px;
+      height: 40px;
+      transform: translate(-36.67%, -36.67%);
+      cursor: pointer;
+    }
+    /* Stones are drawn with a 30px circle using ::before */
+    .intersection::before {
+      content: "";
+      display: block;
+      width: 30px;
+      height: 30px;
+      border-radius: 50%;
+    }
+    .black-stone::before {
+      background-color: black;
+    }
+    .white-stone::before {
+      background-color: white;
+      border: 1px solid black;
+    }
+    /* Basic styling for control buttons and info paragraphs */
+    button { margin: 5px; }
+    #roomForm { text-align: center; margin-top: 20px; }
+    #undoCounter { text-align: center; }
+    /* Style for the custom modal */
+    #undoModal, #restartModal {
+      display: none;
+      position: fixed;
+      top: 50%;
+      left: 50%;
+      transform: translate(-50%, -50%);
+      background-color: #fff;
+      border: 1px solid #000;
+      padding: 20px;
+      z-index: 1000;
+    }
+    #undoModal button, #restartModal button {
+      margin: 10px;
+    }
+    /* Surrender button style */
+    #surrenderButton { margin: 5px; }
+  </style>
+</head>
+<body>
+  <h1>Chinese Go Game - Multiplayer Rooms (Socket.IO)</h1>
+  <div id="roomForm">
+    <input type="text" id="roomInput" placeholder="Enter room name" />
+    <button id="joinRoomButton">Join Room</button>
+  </div>
+  <p id="playerInfo" style="text-align:center;"></p>
+  <p id="turnInfo" style="text-align:center;">Current Turn: <span id="currentTurn">Black</span></p>
+  <!-- Undo counter display -->
+  <p id="undoCounter" style="text-align:center;">Undo requests left: <span id="undoCount">3</span></p>
+  <div style="text-align:center;">
+    <button id="passButton">Pass</button>
+    <button id="undoButton">Undo Last Move</button>
+    <button id="restartButton">Restart New Game</button>
+    <button id="surrenderButton">Surrender</button>
+  </div>
+  <div id="board"></div>
+  
+  <!-- Custom modal for undo request -->
+  <div id="undoModal">
+    <p>Your opponent requests to undo their last move. Do you accept?</p>
+    <button id="undoAcceptButton">Accept</button>
+    <button id="undoDeclineButton">Decline</button>
+  </div>
+
+  <!-- Custom modal for restart negotiation -->
+  <div id="restartModal">
+    <p>Your opponent requests to restart a new game. Do you accept?</p>
+    <button id="restartAcceptButton">Accept</button>
+    <button id="restartDeclineButton">Decline</button>
+  </div>
+  
+  <!-- Include Socket.IO client library -->
+  <script src="/socket.io/socket.io.js"></script>
+  <script>
+    const socket = io();
+    
+    // DOM elements.
+    const boardElement = document.getElementById('board');
+    const currentTurnElement = document.getElementById('currentTurn');
+    const playerInfoElement = document.getElementById('playerInfo');
+    const roomInput = document.getElementById('roomInput');
+    const joinRoomButton = document.getElementById('joinRoomButton');
+    const undoButton = document.getElementById('undoButton');
+    const passButton = document.getElementById('passButton');
+    const restartButton = document.getElementById('restartButton');
+    const surrenderButton = document.getElementById('surrenderButton');
+    const undoCountElement = document.getElementById('undoCount');
+    
+    const undoModal = document.getElementById('undoModal');
+    const undoAcceptButton = document.getElementById('undoAcceptButton');
+    const undoDeclineButton = document.getElementById('undoDeclineButton');
+    
+    const restartModal = document.getElementById('restartModal');
+    const restartAcceptButton = document.getElementById('restartAcceptButton');
+    const restartDeclineButton = document.getElementById('restartDeclineButton');
+    
+    // Game variables.
+    const boardSize = 19;
+    let currentPlayer = 'black';
+    let gameOver = false;
+    let room = null; // room name for this session.
+    let localPlayer = null; // assigned color from the server.
+    
+    const moves = [];
+    const boardState = new Array(boardSize * boardSize).fill("");
+    const intersections = [];
+    const boardHistoryStack = [];
+    boardHistoryStack.push(boardState.join(','));
+    
+    // Variables for undo logic.
+    let undoRequestsRemaining = 3;
+    let lastUndoDeclined = false;
+    
+    // Function to update the undo counter display.
+    function updateUndoCounterDisplay() {
+      undoCountElement.textContent = undoRequestsRemaining;
+    }
+    updateUndoCounterDisplay();
+    
+    // Handle joining a room.
+    joinRoomButton.addEventListener('click', () => {
+      const roomName = roomInput.value.trim();
+      if (!roomName) return alert("Please enter a room name.");
+      room = roomName;
+      socket.emit('joinRoom', roomName);
+    });
+    
+    // When the server assigns a color, update the UI.
+    socket.on('assignColor', function(data) {
+      localPlayer = data.color;
+      room = data.room;
+      playerInfoElement.textContent = `You are ${localPlayer.toUpperCase()} in room "${room}"`;
+      boardElement.style.display = 'block';
+      document.getElementById('roomForm').style.display = 'none';
+      
+      // If spectator, hide control buttons and undo counter.
+      if(localPlayer === 'spectator'){
+         passButton.style.display = 'none';
+         undoButton.style.display = 'none';
+         restartButton.style.display = 'none';
+         surrenderButton.style.display = 'none';
+         document.getElementById('undoCounter').style.display = 'none';
+      }
+    });
+    
+    // Create intersections.
+    for (let row = 0; row < boardSize; row++) {
+      for (let col = 0; col < boardSize; col++) {
+        const index = row * boardSize + col;
+        const intersection = document.createElement('div');
+        intersection.classList.add('intersection');
+        intersection.style.left = (col * 40) + "px";
+        intersection.style.top = (row * 40) + "px";
+        intersection.dataset.index = index;
+        intersection.addEventListener('click', () => {
+          if (currentPlayer === localPlayer && localPlayer !== 'spectator') {
+            handleMove(index);
+          }
+        });
+        boardElement.appendChild(intersection);
+        intersections.push(intersection);
+      }
+    }
+    
+    // Update board appearance.
+    function updateBoard() {
+      for (let i = 0; i < boardState.length; i++) {
+        intersections[i].classList.remove('black-stone', 'white-stone');
+        if (boardState[i] === 'black') {
+          intersections[i].classList.add('black-stone');
+        } else if (boardState[i] === 'white') {
+          intersections[i].classList.add('white-stone');
+        }
+      }
+    }
+    
+    function getNeighbors(index) {
+      const neighbors = [];
+      const row = Math.floor(index / boardSize);
+      const col = index % boardSize;
+      if (row > 0) neighbors.push(index - boardSize);
+      if (row < boardSize - 1) neighbors.push(index + boardSize);
+      if (col > 0) neighbors.push(index - 1);
+      if (col < boardSize - 1) neighbors.push(index + 1);
+      return neighbors;
+    }
+    
+    function getGroup(index, color, visited = new Set()) {
+      const group = [];
+      const stack = [index];
+      while (stack.length > 0) {
+        const current = stack.pop();
+        if (visited.has(current)) continue;
+        visited.add(current);
+        group.push(current);
+        getNeighbors(current).forEach(n => {
+          if (boardState[n] === color && !visited.has(n)) {
+            stack.push(n);
+          }
+        });
+      }
+      return group;
+    }
+    
+    function getLiberties(group) {
+      const liberties = new Set();
+      group.forEach(index => {
+        getNeighbors(index).forEach(n => {
+          if (boardState[n] === "") {
+            liberties.add(n);
+          }
+        });
+      });
+      return liberties;
+    }
+    
+    function violatesKo() {
+      if (boardHistoryStack.length >= 2) {
+        const newState = boardState.join(',');
+        const previousState = boardHistoryStack[boardHistoryStack.length - 2];
+        return newState === previousState;
+      }
+      return false;
+    }
+    
+    function handleMove(index) {
+      if (gameOver || boardState[index] !== "") return;
+      
+      lastUndoDeclined = false; // reset for a new move
+      boardState[index] = currentPlayer;
+      const capturedStones = [];
+      const opponent = currentPlayer === 'black' ? 'white' : 'black';
+      
+      getNeighbors(index).forEach(n => {
+        if (boardState[n] === opponent) {
+          const group = getGroup(n, opponent);
+          if (getLiberties(group).size === 0) {
+            group.forEach(idx => {
+              if (boardState[idx] === opponent) {
+                capturedStones.push({ index: idx, color: opponent });
+                boardState[idx] = "";
+              }
+            });
+          }
+        }
+      });
+      
+      const placedGroup = getGroup(index, currentPlayer);
+      if (getLiberties(placedGroup).size === 0) {
+        boardState[index] = "";
+        capturedStones.forEach(stone => {
+          boardState[stone.index] = stone.color;
+        });
+        alert("Illegal move: suicide is not allowed.");
+        updateBoard();
+        return;
+      }
+      
+      if (violatesKo()) {
+        boardState[index] = "";
+        capturedStones.forEach(stone => {
+          boardState[stone.index] = stone.color;
+        });
+        alert("Illegal move: Ko rule violation.");
+        updateBoard();
+        return;
+      }
+      
+      const moveData = {
+        type: "move",
+        placedIndex: index,
+        color: currentPlayer,
+        captured: capturedStones,
+        room: room
+      };
+      
+      moves.push(moveData);
+      updateBoard();
+      boardHistoryStack.push(boardState.join(','));
+      
+      socket.emit('move', moveData);
+      
+      currentPlayer = opponent;
+      currentTurnElement.textContent = currentPlayer.charAt(0).toUpperCase() + currentPlayer.slice(1);
+    }
+    
+    // Modify the passTurn function so that only the current player may pass.
+    function passTurn() {
+    if (gameOver || currentPlayer !== localPlayer) return;
+    
+    // Create pass data and emit to server.
+    const passData = { type: "pass", color: currentPlayer, room: room };
+    socket.emit('pass', passData);
+    }
+    
+    function calculateScore() {
+      const score = { black: 0, white: 0 };
+      for (let i = 0; i < boardState.length; i++) {
+        if (boardState[i] === 'black') score.black++;
+        else if (boardState[i] === 'white') score.white++;
+      }
+      const visited = new Array(boardState.length).fill(false);
+      for (let i = 0; i < boardState.length; i++) {
+        if (boardState[i] === "" && !visited[i]) {
+          const region = [];
+          const queue = [i];
+          visited[i] = true;
+          const adjacentColors = new Set();
+          while (queue.length > 0) {
+            const current = queue.pop();
+            region.push(current);
+            getNeighbors(current).forEach(n => {
+              if (boardState[n] === "") {
+                if (!visited[n]) {
+                  visited[n] = true;
+                  queue.push(n);
+                }
+              } else {
+                adjacentColors.add(boardState[n]);
+              }
+            });
+          }
+          if (adjacentColors.size === 1) {
+            const soleColor = [...adjacentColors][0];
+            score[soleColor] += region.length;
+          }
+        }
+      }
+      return score;
+    }
+    
+    function endGame() {
+      gameOver = true;
+      const score = calculateScore();
+      let winner = "Tie";
+      if (score.black > score.white) winner = "Black";
+      else if (score.white > score.black) winner = "White";
+      alert(`Game Over!
+Final Score:
+Black: ${score.black}
+White: ${score.white}
+Winner: ${winner}`);
+    }
+
+    // On receiving a pass event, update the moves history and then check if the last two moves are passes.
+    socket.on('pass', function(data) {
+        if (data.room !== room) return;
+        
+        // Add this pass move to the moves history.
+        moves.push(data);
+        boardHistoryStack.push(boardState.join(','));
+        
+        // Check if the last two moves in the history are passes.
+        if (moves.length >= 2 &&
+            moves[moves.length - 1].type === 'pass' &&
+            moves[moves.length - 2].type === 'pass') {
+            endGame();
+        } else {
+            // Switch turn: if the pass came from black, it's now white's turn, and vice versa.
+            currentPlayer = data.color === 'black' ? 'white' : 'black';
+            currentTurnElement.textContent = currentPlayer.charAt(0).toUpperCase() + currentPlayer.slice(1);
+        }
+    });
+
+    socket.on('move', function(data) {
+      if (data.room !== room) return;
+      if (boardState[data.placedIndex] === data.color) return;
+      boardState[data.placedIndex] = data.color;
+      data.captured.forEach(stone => {
+        boardState[stone.index] = "";
+      });
+      moves.push(data);
+      updateBoard();
+      boardHistoryStack.push(boardState.join(','));
+      currentPlayer = data.color === 'black' ? 'white' : 'black';
+      currentTurnElement.textContent = currentPlayer.charAt(0).toUpperCase() + currentPlayer.slice(1);
+    });
+
+    // --- Surrender Logic ---
+    surrenderButton.addEventListener('click', () => {
+      if (gameOver || localPlayer === 'spectator') return;
+      if (!confirm("Are you sure you want to surrender?")) return;
+      socket.emit('surrender', { room: room, surrenderer: localPlayer });
+    });
+    
+    socket.on('surrender', function(data) {
+      if (data.room !== room) return;
+      gameOver = true;
+      const winner = data.surrenderer === 'black' ? 'white' : 'black';
+      alert(`Player ${data.surrenderer.toUpperCase()} surrendered. ${winner.toUpperCase()} wins.`);
+    });
+     
+    // --- Undo Logic ---
+    // Request undo: only allow if the last move was made by you,
+    // if no opponent move has followed, and you have remaining undo requests.
+    undoButton.addEventListener('click', () => {
+      if (localPlayer === 'spectator') return;
+      if (moves.length === 0) return alert("No moves to undo.");
+      const lastMove = moves[moves.length - 1];
+      if (lastMove.color !== localPlayer) {
+        return alert("You can only undo your own last move.");
+      }
+      if (lastUndoDeclined) {
+        return alert("Undo for this move has already been declined.");
+      }
+      if (undoRequestsRemaining <= 0) {
+        return alert("You have used all 3 undo requests.");
+      }
+      
+      // Send an undo request for the last move.
+      socket.emit('undoRequest', { room: room, move: lastMove, requester: localPlayer });
+    });
+    
+    // We'll store a pending undo request (for the opponent) so we can process it.
+    let pendingUndoRequest = null;
+    
+    // When receiving an undo request, show the custom modal to the opponent.
+    socket.on('undoRequest', function(data) {
+      if (data.room !== room) return;
+      // Only the opponent (non-requester and non-spectator) sees the modal.
+      if (data.requester === localPlayer || localPlayer === 'spectator') return;
+      pendingUndoRequest = data;
+      // Show the modal.
+      undoModal.style.display = 'block';
+    });
+    
+    // When the opponent clicks Accept.
+    undoAcceptButton.addEventListener('click', function() {
+      if (pendingUndoRequest) {
+        socket.emit('undoResponse', { room: room, accepted: true, requester: pendingUndoRequest.requester });
+        undoModal.style.display = 'none';
+        pendingUndoRequest = null;
+      }
+    });
+    
+    // When the opponent clicks Decline.
+    undoDeclineButton.addEventListener('click', function() {
+      if (pendingUndoRequest) {
+        socket.emit('undoResponse', { room: room, accepted: false, requester: pendingUndoRequest.requester });
+        undoModal.style.display = 'none';
+        pendingUndoRequest = null;
+      }
+    });
+    
+    // When receiving an undo response.
+    socket.on('undoResponse', function(data) {
+    if (data.room !== room) return;
+    if (data.accepted) {
+        // All clients remove the last move if they have it.
+        if (moves.length > 0) {
+        const lastMove = moves.pop();
+        boardHistoryStack.pop();
+        boardState[lastMove.placedIndex] = "";
+        lastMove.captured.forEach(stone => {
+            boardState[stone.index] = stone.color;
+        });
+        updateBoard();
+        // Set turn back to the requester.
+        currentPlayer = data.requester;
+        currentTurnElement.textContent = currentPlayer.charAt(0).toUpperCase() + currentPlayer.slice(1);
+        }
+        // Only the requester gets the alert and update of undo counters.
+        if (data.requester === localPlayer) {
+        alert("Undo accepted. Your last move has been undone.");
+        undoRequestsRemaining--;
+        updateUndoCounterDisplay();
+        }
+    } else {
+        // If declined, only the requester shows an alert and marks that move as locked.
+        if (data.requester === localPlayer) {
+        alert("Undo request declined by your opponent.");
+        lastUndoDeclined = true;
+        undoRequestsRemaining--;
+        updateUndoCounterDisplay();
+        }
+    }
+    });
+
+    
+    // --- Restart / Surrender Restart Negotiation ---
+    // For restarting, we use a negotiation modal similar to undo.
+    // Two cases: (a) game over (via endGame or surrender) or (b) active game with a surrender.
+    // The Restart button is only active when the game is over.
+    // If the game is not over, the Surrender button must be clicked first.
+    
+    restartButton.addEventListener('click', () => {
+      if (localPlayer === 'spectator') return;
+      if (!gameOver) {
+        alert("You can only request a restart after the game is over (or after surrendering).");
+        return;
+      }
+      // Send a restart request.
+      socket.emit('restartRequest', { room: room, requester: localPlayer });
+    });
+    
+    let pendingRestartRequest = null;
+    socket.on('restartRequest', function(data) {
+      if (data.room !== room) return;
+      if (data.requester === localPlayer || localPlayer === 'spectator') return;
+      pendingRestartRequest = data;
+      restartModal.style.display = 'block';
+    });
+    
+    restartAcceptButton.addEventListener('click', function() {
+      if (pendingRestartRequest) {
+        socket.emit('restartResponse', { room: room, accepted: true, requester: pendingRestartRequest.requester });
+        restartModal.style.display = 'none';
+        pendingRestartRequest = null;
+      }
+    });
+    
+    restartDeclineButton.addEventListener('click', function() {
+      if (pendingRestartRequest) {
+        socket.emit('restartResponse', { room: room, accepted: false, requester: pendingRestartRequest.requester });
+        restartModal.style.display = 'none';
+        pendingRestartRequest = null;
+      }
+    });
+    
+    socket.on('restartResponse', function(data) {
+    if (data.room !== room) return;
+    if (data.accepted) {
+        // Restart the game on every client.
+        localRestartGame();
+        alert("Restart accepted. A new game has started.");
+    } else {
+        // Only notify the requester if the restart was declined.
+        if (data.requester === localPlayer) {
+        alert("Restart request declined by your opponent.");
+        }
+    }
+    });
+    
+    function localRestartGame() {
+      currentPlayer = 'black';
+      gameOver = false;
+      moves.length = 0;
+      boardHistoryStack.length = 0;
+      for (let i = 0; i < boardState.length; i++) {
+        boardState[i] = "";
+      }
+      boardHistoryStack.push(boardState.join(','));
+      currentTurnElement.textContent = currentPlayer.charAt(0).toUpperCase() + currentPlayer.slice(1);
+      updateBoard();
+
+      // Reset undo-related variables for a new game.
+      undoRequestsRemaining = 3;
+      lastUndoDeclined = false;
+      updateUndoCounterDisplay();
+    }
+
+    // Socket listeners for move and pass remain unchanged.
+    // (See earlier sections for their code.)
+    passButton.addEventListener('click', passTurn);
+    
+  </script>
+</body>
+</html>
